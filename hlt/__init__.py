@@ -6,6 +6,6 @@ the start, then in a loop, call get_map() to get the current game state, then
 build up a list of commands and send them with send_command_queue().
 """
 
-from . import collision, constants, entity, game_map, networking
+from . import collision, constants, entity, game_map, networking, util
 
 from .networking import Game

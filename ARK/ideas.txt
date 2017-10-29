@@ -1,0 +1,139 @@
+Bot History
+  v0_settler  0.1029  s9r560
+    1st unowned-planet on list
+  v1_nearest  1.1030  s17r300
+    nearest unowned planet
+    avoid hit ships
+  v2_speed  1.1030  s15r350
+    max speed
+  v3_mine_then_hit  5.1103  s15r450
+    nearest unowned/unfull-planet
+    else -> nearest enemy docked ship
+      hmm majority of ships are still stuck due to navigation function too naive
+  v4_rough_angler  5.1103  s10r700
+    reduce computation & timeout
+      angler_step 1 -> 30 to 
+  v5_fewer_adjusts  6.1104  s21r360
+    reduce computation & timeout
+      angler_step: 30 -> 10
+      max_corrections: 90 -> 10
+  v6_unify_targets_reduce_collision  3.1115
+    unify target selection
+      naive eval
+    reduce collision
+      consider both start & end Positions of path
+  v7_route_better  4.1116  s35r150-s37r110
+    route traffic
+      stretch reserved_locs from end-pts only to mult-pts along path
+      add stationary ship loc -> reserved_locs
+    ** memo
+      save target claims
+  v8_scan_perim_fix_thrust  2.1121  s44r35
+    ** scan_perim
+      naive-scan goal-planet perimeter for nearby foe_ships
+      each subsequent scan finds next nearest threat in perimeter
+    fix_thrust
+      fix issues from integer-rounding on speed & invalid angle outside [0, 359]
+  v9_memo
+    memo
+      rewrite _parse
+        update instead of recreate existing Entities
+        facilitate in-Entity memos
+    eval_goal
+      global sort all ships' all goals then allocate
+      eff_dist
+        planet: dist - DOCK_RADIUS - p.radius
+        foe_ship: dist - WEAPON_RADIUS
+    nav
+      add time to path.cross() check
+        allow more compact routing?
+      max-reach
+        nearest-obstacle -> max-reach -> max-thrust
+  ~~~~~~~~~~~~~~
+  v10_guess_scan_evade_swarm
+    nav
+      smart_adjust
+        alter angle by tangent of nearest-obstacle
+      check_boundary
+        adjust target if out-of-bounds
+    strat
+      next_pos
+        use own eval_goal as baseline to guess foe paths
+      evade overpowering foes
+      form swarm
+
+
+
+  TODO
+    strat
+      scan_area: foe_next_produced_ship + foe_planet.spawn_spot
+    nav
+      coordinate swarm
+        formation ?
+      next_pos
+        update player-specific attack-target-separation based on observed separation
+      preprocess pathfind graph ?
+    
+
+
+Policy
+  evaluate(planet)
+    free (unclaimed) or open (unfull)
+      v: BASE_PRODUCTIVITY
+      t: DOCK_TURNS
+    full
+      v: 0 for now?
+        +protection value later
+          danger: enemy/friend
+            present -> predicted threat vectors
+      t: 0
+    enemy
+      v: BASE_PRODUCTIVITY
+      t: sum(docked_ship_health)/damage + DOCK_TURNS
+  discount(planet, wait_time)
+    time
+      naive
+        dist/max_speed + wait_time
+    discount_factor
+      try different vals
+
+
+
+Selecting target
+  pass 0
+    each ship keeps auto-resorted {effective-dist: target}
+    globally also keep auto-resorted {effective-dist: my_ship}
+  pass 1
+    pop-off 1st
+    update all others
+    repeat
+
+
+Spatial scan
+  {x: y: Entity}
+  within tol, trace along sight-path & check (x->y) for collision
+
+
+
+
+Tools
+  run_game.sh & gym.sh
+    $1 vs MyBot
+    mv outputs
+  submit.sh
+    zip -> $1.zip -> submit
+  hlt_client
+    flatten dir
+    retarget log output into separate dir
+  gym.sh
+    compare_bots.py
+      show bot names
+  pythonize generic run script
+    compile stats
+      {agg, avg} x {turns, prod, damage}
+    options
+      seed
+      sizes
+      which bots
+      num games
+  ~~~~~~~~~~~~~~

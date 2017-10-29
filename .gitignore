@@ -1,4 +1,8 @@
 *.hlt
 *.log
 *.pyc
-*.zip
+*.swp
+outputs/*
+ARK/v*/
+ARK/*.sh
+hlt_client

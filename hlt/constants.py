@@ -1,3 +1,6 @@
+import math
+
+
 #: Max number of units of distance a ship can travel in a turn
 MAX_SPEED = 7
 #: Radius of a ship
@@ -29,7 +32,30 @@ SPAWN_RADIUS = 2.0
 # custom
 #: Min distance a ship needs to move (other than staying = 0)
 MIN_MOVE_SPEED = 1
-#: Desired separation to fight target
-SEP_DESIRED_FIGHT = WEAPON_RADIUS - SHIP_RADIUS
-TOLERANCE = 1e-3
+#: numericals
 PRECISION = 4  # decimal-places
+TOL = 1e-3  # engine numerical tolerance
+FUDGE = 5e-2  # engine ship-geometry tolerance
+#: Various separation bounds (min, optimal, max); net radii !
+SEP_KAMIKAZE = 0.
+SEPS_DOCK = (
+  FUDGE,
+  FUDGE,
+  DOCK_RADIUS - TOL
+)
+SEPS_FIGHT = (
+  FUDGE,
+  WEAPON_RADIUS - 2*SHIP_RADIUS - FUDGE,
+  WEAPON_RADIUS - 2*SHIP_RADIUS - FUDGE
+)
+SEPS_EVADE = (
+  WEAPON_RADIUS - 2*SHIP_RADIUS + FUDGE,
+  # WEAPON_RADIUS - 2*SHIP_RADIUS + FUDGE,
+  WEAPON_RADIUS + MAX_SPEED,
+  math.inf
+)
+SEPS_RALLY = (
+  FUDGE,
+  FUDGE,
+  math.inf
+)

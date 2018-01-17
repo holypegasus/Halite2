@@ -34,7 +34,7 @@ Bot History
       each subsequent scan finds next nearest threat in perimeter
     fix_thrust
       fix issues from integer-rounding on speed & invalid angle outside [0, 359]
-  v9_memo
+  v9_memo  0.1126  s45r57
     memo
       rewrite _parse
         update instead of recreate existing Entities
@@ -45,12 +45,12 @@ Bot History
         planet: dist - DOCK_RADIUS - p.radius
         foe_ship: dist - WEAPON_RADIUS
     nav
-      add time to path.cross() check
+      ** add time to path.cross() check
         allow more compact routing?
       max-reach
         nearest-obstacle -> max-reach -> max-thrust
   ~~~~~~~~~~~~~~
-  v10_guess_scan_evade_swarm
+  v10_guess_scan_evade_swarm  WIP
     nav
       smart_adjust
         alter angle by tangent of nearest-obstacle
@@ -61,17 +61,33 @@ Bot History
         use own eval_goal as baseline to guess foe paths
       evade overpowering foes
       form swarm
+      scan_area
+        foe_next_produced_ship + foe_planet.spawn_spot
+      planet-scan
+        is_matched filters for only allies closer than inquirer!
+        check foe_imobos too!
+      swarm-rotate
+        lower hp further back
+        visual: Roman legionaries ~ 风灵珠
+        sep_opt -= swarm-hp-normalized-% * UNIT
 
+  v11
+    ignore foe_imobo stren if not w/ foe_mobo
+    engage planet-scan foe only if undermatched
+      drop previous goal-stickiness
+
+    if even match, evade no further than my_imobo nearest foe
+    consider planet pending ships
 
 
   TODO
     strat
-      scan_area: foe_next_produced_ship + foe_planet.spawn_spot
     nav
-      coordinate swarm
-        formation ?
-      next_pos
-        update player-specific attack-target-separation based on observed separation
+      profile online
+        detect rush
+          if foe's apparent prev_goal -> curr_goal getting closer ?
+        update after seeing
+          sep: my_guess vs actual
       preprocess pathfind graph ?
     
 

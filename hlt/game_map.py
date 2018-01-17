@@ -1,12 +1,12 @@
-import logging, math
+import copy, logging, math
 from collections import defaultdict, namedtuple
 from math import floor, ceil, sqrt, degrees, asin
 
-from .collision import get_tangents
 from .constants import SHIP_RADIUS, DOCK_RADIUS, MIN_MOVE_SPEED, MAX_SPEED
-from .constants import WEAPON_RADIUS, SEP_DESIRED_FIGHT
-from .constants import TOLERANCE, PRECISION
-from .entity import Entity, Planet, Ship, Pos, Vect
+from .constants import WEAPON_RADIUS
+from hlt.constants import TOL, PRECISION, FUDGE
+from hlt.constants import SEPS_DOCK, SEPS_FIGHT, SEPS_EVADE, SEPS_RALLY
+from .entity import Entity, Planet, Ship, Pos, Bound, Vect
 from .util import logitr, timit
 
 
@@ -18,7 +18,6 @@ class Map:
   :ivar width: Map width
   :ivar height: Map height
   """
-
   def __init__(self, my_id, width, height):
     """
     :param my_id: User's id (tag)
@@ -30,14 +29,19 @@ class Map:
     self.height = height
     self._players = dict()  # player_id -> Player
     self._planets = dict()  # planet_id -> Planet
+    self._ships = dict()  # ship_id -> Ship
     # custom
+    self.x_min = self.y_min = 0
+    self.x_max = self.width
+    self.y_max = self.height
     self.center = Pos(self.width/2, self.height/2, r=0.)
+    self.bound = Bound(0, width, 0, height)
     # memos: updated beginning of each turn
     self.rec = dict()
     self.recs = dict()  # player_id -> player_record
-    self.obsts = set()  # occupied Entity/Loc
-    self.dests = set()  # mobo ships' intended next Position
-    self.paths = []  # dynamic-obsts: plotted ship-paths
+    self.obsts = set()  # static Entities
+    self.dests = set()  # mobo ships' routed next Pos
+    self.paths = []  # dynamic-obsts: plotted path Vects; e1 also gets added to self.dests
 
   def get_player(self, player_id):
     """
@@ -76,6 +80,9 @@ class Map:
     """
     return list(self._planets.values())
 
+  def get_ship(self, ship_id):
+    return self._ships.get(ship_id)
+
   ### NB mod _parse* to update instead of recreate player & planet if exists
   # NB parse new PLAYER info -> del or update
   def _parse_players(self, tokens):
@@ -91,8 +98,13 @@ class Map:
     # update
     for pid in prev_pids & curr_pids:
       self._players[pid].update_player(pid2player[pid])
-    return tokens
+    # update game_map._ships
+    self._ships = dict()
+    for player in pid2player.values():
+      self._ships.update(player.sid2ship)
+    # logging.critical(self._ships)
 
+    return tokens
 
   # NB parse new PLANET info -> del or update
   def _parse_planets(self, tokens):
@@ -114,7 +126,6 @@ class Map:
 
     return tokens
 
-
   # @timit
   def _parse(self, map_string):
     """
@@ -133,7 +144,6 @@ class Map:
 
     assert(len(tokens) == 0)  # expect no more tokens
     self._link()
-  #######
 
   def _link(self):
     """
@@ -156,7 +166,7 @@ class Map:
       all_ships.extend(player.all_ships())
     return all_ships
 
-  def _intersects_entity(self, target):
+  def __intersects_entity(self, target):
     """
     Check if the specified entity (x, y, r) intersects any planets. Entity is assumed to not be a planet.
 
@@ -172,7 +182,7 @@ class Map:
         return celestial_object
     return None
 
-  def obstacles_between(self, ship, target, ignore=()):
+  def __obstacles_between(self, ship, target, ignore=()):
     """
     Check whether there is a straight-line path to the given point, without planetary obstacles in between.
 
@@ -193,7 +203,7 @@ class Map:
     return obstacles
 
 
-  #######
+  ### MEMO
   # thru-turn memos
   def show_goals_of(self, level=logging.DEBUG):
     # TMP for now only consider non-my ships to be valid goals
@@ -208,16 +218,16 @@ class Map:
 
   # given new (ship, goal), update ship.goal & goal.goals_of
   def update_ship8goal_memos(self, ship, goal):
-    assert isinstance(goal, Ship) or isinstance(goal, Planet)
     # check if to deregister prev goal
     # ship can only have 1 goal
     prev_goal = ship.goal
-    if prev_goal:
+    if prev_goal and isinstance(prev_goal, (Ship, Planet)):
       prev_goal.goals_of.discard(ship)  # won't complain like remove()
     # register curr goal
     # goal might have >= 1 ship
     ship.goal = goal
-    goal.goals_of.add(ship)
+    if isinstance(goal, Ship) or isinstance(goal, Planet):
+      goal.goals_of.add(ship)
 
   # in-turn memos
   # calc turn-stats -> namedtuple record
@@ -227,7 +237,7 @@ class Map:
     my_ships = set(self.get_me().all_ships())
     my_mobos = set(s for s in my_ships if s.is_mobo())
     my_imobos = my_ships - my_mobos
-    logging.info('My Ships: %s/%s MOBO!', len(my_mobos), len(my_ships))
+    logging.debug('My Ships: %s/%s MOBO!', len(my_mobos), len(my_ships))
     foe_ships = all_ships - my_ships
     foe_mobos = set(s for s in foe_ships if s.is_mobo())
     foe_imobos = foe_ships - foe_mobos
@@ -276,13 +286,10 @@ class Map:
     self.recs[player_id] = rec
     return rec
 
-
   # reset obsts
-  # TODO replace static ships w/ "where puck will be"
   def reset_obsts(self):
     r = self.rec
     self.obsts = r.all_planets | r.my_imobos | r.foe_imobos
-    logitr(self.obsts, 'game_map.obsts', logging.DEBUG)
 
   def add_obst(self, new_obst):
     # assert new_obst not in self.obsts
@@ -299,7 +306,7 @@ class Map:
 
   def add_path(self, new_path):
     self.paths.append(new_path)
-    self.add_dest(new_path.e1)
+    # self.add_dest(new_path.e1)
 
   # recalc/reset in-turn memos
   # @timit
@@ -310,109 +317,151 @@ class Map:
     self.reset_dests()
 
 
+  ### NAV
+  # -> adj_pos: Pos
+  # bound target pos to within game_map
+  # TODO fix
+  def bounds(self, target):
+    return (
+      self.x_min <= target.x <= self.x_max
+      and self.y_min <= target.y <= self.y_max
+    )
+
+  def bound_target(self, ship, target):
+    logging.warning(target)
+    if self.bounds(target):
+      return target
+    sx = 1 if target.x >= ship.x else -1
+    sy = 1 if target.y >= ship.y else -1
+    # determine where out-of-bounds
+    adj_x = adj_y = None
+    if target.x < 0:
+      adj_x = self.x_min
+    elif target.x > self.width:
+      adj_x = self.x_max
+    if target.y < 0:
+      adj_y = self.y_min
+    elif target.y > self.height:
+      adj_y = self.y_max
+    # calc necessary adjustments
+    dx = dy = 0
+    if adj_x is not None and adj_y is not None:
+      dx = sx * abs(adj_x - ship.x)
+      dy = sy * abs(adj_y - ship.y)
+    elif adj_x is not None:
+      dx = sx * abs(adj_x - ship.x)
+      dy = sy * sqrt(MAX_SPEED**2 - dx**2)
+    elif adj_y is not None:
+      dy = sy * abs(adj_y - ship.y)
+      dx = sx * sqrt(MAX_SPEED**2 - dy**2)
+    # make & return adjusted target
+    adj_target = Pos(ship.x+dx, ship.y+dy, SHIP_RADIUS)
+    if not self.bounds(adj_target):
+      logging.warning('still not bound: %s', adj_target)
+    logging.warning('%s adjusts %s -> %s', ship, target, adj_target)
+    return adj_target
+
   # -> target: Entity
-  # target: int-dist & int-angle from ship due to engine-constraint
-  def get_nav_target(self, ship, goal):
-    logging.debug('%s get_target %s', ship, goal)
-    if isinstance(goal, Planet):
-      # hug planet to preempt block
-      goal_next_pos = goal
-      sep = SHIP_RADIUS
-    elif isinstance(goal, Ship):
-      goal_next_pos = self.next_pos(goal)
-      sep_desired = SEP_DESIRED_FIGHT
-      dist_to_goal = ship.dist(goal_next_pos)
-      if dist_to_goal <= sep_desired:
-        # backoff to maintain desired max/optimal separation
-        sep = sep_desired
-      else:
-        """# NB when just beyond, make sure THRUST at least 1 to enter WR
-          eg @5.28 away trying to keep 4 min_dist from a radius 0.5 ship
-          0.78 thrust rounds to 0 !!!
-          want: 1 <= THRUST = dist_to_goal - (desired_min_dist + goal.radius)
-          thus: min_dist = dist_to_goal - goal.radius - 1 in edge case"""
-        sep_min_move = max(0, dist_to_goal - MIN_MOVE_SPEED - goal_next_pos.radius)
-        sep = min(sep_desired, sep_min_move)
-    else:  # goal is a Pos
-      goal_next_pos = goal
-      sep = 0.
-
+  # given target: Pos, derive context-appropriate nav_target
+  # get engine-compliant, reachable nav_target from target
+  # int-dist & int-angle from ship a la engine-constraint
+  def get_nav_target(self, ship, seps, log=True):    
     # make eff_target
-    target = ship.perigee(goal_next_pos, min_dist=sep)
-    logging.info('Navigating %s --d:%s--> %s', ship, ship.dist(target), target)
-    reach = init_reach = MAX_SPEED
-    angle = init_angle = round(ship.angle(target))  # follow engine
-    # check if target within 1-hop reach (not counting obsts) -> effective-target
-    dist_to_target = ship.dist(target)
-    if dist_to_target <= init_reach:
-      reach = int(dist_to_target)  # follow engine
-    # TODO check if target out-of-bounds ?
-
-    eff_target = ship.get_pos(reach, angle)
-    logging.info('%s -> %s: eff_target: %s', ship, goal, eff_target)
+    sep_opt = seps[1]  # optimal separation
+    # nav_target = ship.perigee(ship.target, sep_opt)
+    assert ship.target is not None
+    angle = ship.angle(ship.target)
+    if self._calc_sep(ship, ship.target, log) < sep_opt:
+      angle = (angle + 180) % 360
+    eff_target = self._get_min_d_pos(ship, angle, ship.target, seps, log)
+    if log:
+      logging.warning('target: %s', ship.target)
+      logging.warning('optimal sep: %.1f', sep_opt)
+      logging.warning('eff_target: %s', eff_target)
     return eff_target
 
 
-  # -> reach: float; nearest_hit: Entity
-  # reach: furthest flight w/o hit, rounded down to nearest int
-  # nearest_hit: first Entity to hit along |ship->target|
-  def max_reach(self, ship, target, evade_paths=[], tol=TOLERANCE):
-    test_path = Vect(ship, target)
-    # get obstacles
+  def _filter_obstacles(self, ship_path, evade_paths, log=True):
+    ship, nav_target = ship_path.e0, ship_path.e1
     # TODO smarter filter
-    foe_paths = evade_paths
-    # logging.warning('evade foe_paths: %s', foe_paths)
-    paths = self.paths + foe_paths
+    paths = self.paths + evade_paths
     filter_paths = [p for p in paths
-      if test_path.center.dist(p.center) <= MAX_SPEED + 2*SHIP_RADIUS]
-    poses = self.obsts | self.dests - set([ship, target])
+      if ship_path.center.dist(p.center) <= MAX_SPEED + ship_path.radius + p.radius]
+
+    my_pending_mobos = set([s for s in self.rec.my_mobos if not s.dest])
+    poses = my_pending_mobos | self.obsts | self.dests
+    poses -= set([ship, nav_target])
+    assert ship not in poses and nav_target not in poses
     filter_poses = sorted([s for s in poses
-      if test_path.center.dist(s) <= 0.5*MAX_SPEED + SHIP_RADIUS + s.radius],
+      if ship_path.center.dist(s) <= 0.5*MAX_SPEED + ship_path.radius + s.radius],
       key=lambda s: ship.dist(s)
     )
     obstacles = filter_paths + filter_poses
-    # logitr(obstacles, 'obstacles', 30)
+    # TEST add boundaries as hard-obstacles
+    obstacles.append(self.bound)
+
+    # if log:
+      # logitr(obstacles, 'filtered obstacles', 30)
+    return obstacles
+
+  def _get_nearest_hit(self, ship_path, obstacles, log=True):
     # find min_dist_hit / reach
-    max_reach_dist = round(ship.dist(target))
-    max_reach_pos = target
+    max_reach_dist = min(MAX_SPEED, int(round(ship_path.len)))
     min_hit_ent = None
-
-    # find nearest hit
     for ob in obstacles:
-      d, p, e = test_path.cross(ob)
-      if d + tol < max_reach_dist:
-        logging.info('obstacle: %s: dpe (%.2f, %s, %s) !', ob, d, p, e)
+      d, e = ship_path.cross(ob)
+      # regular
+      if d + TOL < max_reach_dist:
         max_reach_dist = d
-        max_reach_pos = p
         min_hit_ent = e
+    if log:
+      logging.info('reach: %.1f; hit_ent:%s', max_reach_dist, min_hit_ent)
+    return max_reach_dist, min_hit_ent
 
-    logging.info('Raw: max_reach_dist: %.2f; max_reach_pos: %s; min_hit_ent: %s', max_reach_dist, max_reach_pos, min_hit_ent)
-    reach = max(0, max_reach_dist)
+  # target <= MAX_SPEED away
+  # -> reach: float| furthest flight w/o hit, rounded down nearest int
+  # -> nearest_hit: Entity| first Entity to hit along |ship->target|
+  def max_reach(self, ship, nav_target, log=True):
+    logging.info('Trying ^%d .-.-> %s...', ship.angle(nav_target), nav_target)
+    ship_path = Vect(ship, nav_target)
+    obstacles = self._filter_obstacles(ship_path, ship.evade_paths, log)
+    reach, min_hit_ent = self._get_nearest_hit(ship_path, obstacles, log)
+    # reach = max(0, max_reach_dist)
     # convert reach to int:
     # generally round down to avoid overshoot unless
     # really close to its nearest int (indicative of float-pt rounding issue)
-    if abs(reach - round(reach)) >= tol:
+    if abs(reach - round(reach)) >= TOL:
       reach = int(reach)
     else:
       reach = int(round(reach))
-    if reach <= tol:
+    # create reach_pos based on adjusted reach
+    if reach <= TOL:
       reach_pos = ship.curr_pos
     else:
-      reach_pos = test_path.d_along(reach)
-    logging.info('%s -> %s max_reach dpe: %s, %s, %s', ship, target, reach, reach_pos, min_hit_ent)
-    return reach, reach_pos, min_hit_ent
+      reach_pos = ship_path.d_along(reach)
+
+    sep = self._calc_sep(reach_pos, ship.target)
+    if log:
+      logging.info('final srpe: %.2f, %d, %s, %s', sep, reach, reach_pos, min_hit_ent)
+    return sep, reach, reach_pos, min_hit_ent
 
 
   # -> (tang_l_ngl, tang_l): (int, Entity)
   # -> (tang_r_ngl, tang_r): (int, Entity)
-  def get_tangents(self, src, dst, fudge=0.01):
+  def _get_tangs(self, src, dst, fudge=FUDGE):
     assert isinstance(src, Entity) and isinstance(dst, Entity)
+    logging.info('%s /O\ %s', src, dst)
+    logging.debug('%s -> %s', src, dst)
     rise = dst.radius + SHIP_RADIUS + fudge
-    logging.debug('rise: %s', rise)
+    logging.debug('rise (tang-dst): %s', rise)
     hypo = max(rise, src.dist(dst))
-    logging.debug('hypo: %s', hypo)
+    logging.debug('hypo (src-dst): %s', hypo)
     run = sqrt(abs(hypo**2 - rise**2))
+    logging.debug('run (src-tang): %s', run)
+    int_length_to_tang = ceil(run)
+    logging.debug('int_length_to_tang: %s', int_length_to_tang)
     abs_ngl_src_obst = src.angle(dst)  # coordinate-system absolute-angle
+    logging.debug('abs ngl src->obst: %s', abs_ngl_src_obst)
     try:
       rel_ngl_obst_src_tangent = degrees(asin(rise / hypo))  # relative-angle
     except ValueError as err:
@@ -423,193 +472,198 @@ class Map:
     logging.debug('Tangent int(ngl): %s', d_angle)
     tang_l_ngl = floor(abs_ngl_src_obst - d_angle) % 360
     logging.debug('left-tangent abs-ngl: %s', tang_l_ngl)
-    tang_l = src.get_pos(MAX_SPEED, tang_l_ngl)
+    # tang_l = src.get_pos(int_length_to_tang, tang_l_ngl)
     tang_r_ngl = ceil(abs_ngl_src_obst + d_angle) % 360
     logging.debug('right-tangent abs-ngl: %s', tang_r_ngl)
-    tang_r = src.get_pos(MAX_SPEED, tang_r_ngl)
-    logging.info('tangents: ^%s:%s; ^%s:%s', tang_l_ngl, tang_l, tang_r_ngl, tang_r)
-    return (tang_l_ngl, tang_l), (tang_r_ngl, tang_r)
+    # tang_r = src.get_pos(int_length_to_tang, tang_r_ngl)
+    # logging.info('tangs: ^%s:%s; ^%s:%s', tang_l_ngl, tang_l, tang_r_ngl, tang_r)
+    logging.info('tang_ngls: ^%s & ^%s', tang_l_ngl, tang_r_ngl)
+    # return (tang_l_ngl, tang_l), (tang_r_ngl, tang_r)
+    return tang_l_ngl, tang_r_ngl
 
-  # -> min_hit_ent, min_sep, min_sep_reach, min_sep_angle
-  def update_sep_from_tangent(self, explored, ship, min_hit_ent, tang_dir, evade_paths, goal_next_pos, leader_sep, min_sep, min_sep_reach, min_sep_angle):
-    (tang_l_ngl, tang_l), (tang_r_ngl, tang_r) = self.get_tangents(ship, min_hit_ent)
-    if tang_dir == 'L':
-      tang = tang_l
-      tang_ngl = tang_l_ngl
-    else:
-      tang = tang_r
-      tang_ngl = tang_r_ngl
-    # max_reach tang
-    logging.info('Check tang %s: ^%s@%s', tang_dir, tang_ngl, tang)
-    reach, reach_pos, min_hit_ent = self.max_reach(ship, tang, evade_paths)
-    sep = reach_pos.dist(goal_next_pos)
-    logging.info('sep: %s: tang max_reach', sep)
-    # try match or nearer leader_sep to leader target ?
-    logging.info('leader_sep: %s', leader_sep)
-    prev_sep = math.inf
-    # tangents first aim to go MAX_SPEED
-    # we now check if interm reach even smaller separation
-    for r in range(1, reach+1):
-      reach_pos = ship.get_pos(r, tang_ngl)
-      sep = reach_pos.dist(goal_next_pos)
-      logging.info('sep: %s <- reach %s, reach_pos %s', sep, r, reach_pos)
-      if sep >= prev_sep:
+  # -> pos: Pos|
+  # ship ^:angle d:[seps] -> pos .-.-> target
+  def _get_min_d_pos(self, ship, angle, target, seps, log=True):
+    sep_min, sep_opt, sep_max = seps
+    # memo
+    reach = 0
+    pos = ship.curr_pos
+    sep = self._calc_sep(pos, target)
+    min_diff = self._diff_opt(sep, seps)  # distance to optimal-sep
+
+    while reach < MAX_SPEED:
+      reach += 1
+      next_pos = ship.get_pos(reach, angle)
+      sep = self._calc_sep(next_pos, target)
+      diff = self._diff_opt(sep, seps)
+      if min_diff < diff:
         break
-      if sep < min_sep:
-        min_sep = sep
-        min_sep_reach = r
-        min_sep_angle = tang_ngl
-        if sep <= leader_sep:
-          break
-      prev_sep = sep
-    # keep checking while still hitting & not already considered min_hit_ent
-    while SEP_DESIRED_FIGHT <= min_sep and min_hit_ent and min_hit_ent not in explored:
-      explored.add(min_hit_ent)  # prevent repeat -> infinite recursion!
-      min_hit_ent, min_sep, min_sep_reach, min_sep_angle = self.update_sep_from_tangent(explored, ship, min_hit_ent, tang_dir, evade_paths, goal_next_pos, leader_sep, min_sep, min_sep_reach, min_sep_angle)
+      else:
+        pos = next_pos
+        min_diff = diff
+        # if log:
+        #   logging.warning('%s d%d ^%d %s -> new min_diff: %.2f', ship, reach, angle, pos, min_diff)
+    if log:
+      logging.warning('^%d; tgt: %s; seps: %s', angle, target, seps)
+      logging.info('%s -> %s: sep: %.1f; diff_opt: %.1f.-> %s', ship, pos, self._calc_sep(pos, target), min_diff, target)
+    return pos
 
-    return min_hit_ent, min_sep, min_sep_reach, min_sep_angle
+  # if explored or close enough to an explored pos
+  def _seen_pos(self, pos, explored):
+    return (
+      not isinstance(pos, Entity)
+      or any(ex.dist(pos) <= FUDGE for ex in explored)
+    )
 
+  # -> min_res: (min_diff, reach, angle)
+  # recurse check next tangent while diff(sep, sep_opt) improving
+  # keep checking while unexplored min_hit_ent
+  def tang_update_min_res(self, explored, ship, min_hit_ent, seps, min_res, tang_dir=None):
+    explored.add(min_hit_ent)
+    # check both tangents
+    if not tang_dir:
+      l_explored = copy.copy(explored)
+      res_left = self.tang_update_min_res(l_explored, ship, min_hit_ent, seps, min_res, 'L')
+      r_explored = copy.copy(explored)
+      res_right = self.tang_update_min_res(r_explored, ship, min_hit_ent, seps, min_res, 'R')
+      min_res = min(min_res, res_left, res_right)
+      return min_res
+    # check 1-tangent
+    tang_l_ngl, tang_r_ngl = self._get_tangs(ship, min_hit_ent)
+    if tang_dir == 'L':
+      angle = tang_l_ngl
+    elif tang_dir == 'R':
+      angle = tang_r_ngl
+    pos = self._get_min_d_pos(ship, angle, ship.target, seps)
+    sep, reach, reach_pos, min_hit_ent = self.max_reach(ship, pos)
+    logging.info('Check tang %s: ^%d %s', tang_dir, angle, pos)
+    logging.info('sep: %.2f: tang max_reach', sep)
+    res = (self._diff_opt(sep, seps), reach, angle)
+    min_res = min(min_res, res)
+    # keep checking unexplored tangents while still hitting
+    if not self._seen_pos(min_hit_ent, explored):
+      logging.warning('Recursing: %s -> %s', min_hit_ent, explored)
+      min_res = self.tang_update_min_res(explored, ship, min_hit_ent, seps, min_res, tang_dir)
+    return min_res
 
-  # -> adj_pos: Pos
-  def adjust_if_out_of_bounds(self, ship, reach, target):
-    sx = 1 if target.x >= ship.x else -1
-    sy = 1 if target.y >= ship.y else -1
-    # determine where out-of-bounds
-    adj_x = adj_y = None
-    if target.x < 0:
-      adj_x = 0
-    elif target.x > self.width:
-      adj_x = self.width
-    if target.y < 0:
-      adj_y = 0
-    elif target.y > self.height:
-      adj_y = self.height
-    # calc necessary adjustments
-    dx = dy = 0
-    if adj_x is not None and adj_y is not None:
-      dx = sx * abs(adj_x - ship.x)
-      dy = sy * abs(adj_y - ship.y)
-    elif adj_x is not None:
-      dx = sx * abs(adj_x - ship.x)
-      dy = sy * sqrt(reach**2 - dx**2)
-    elif adj_y is not None:
-      dy = sy * abs(adj_y - ship.y)
-      dx = sx * sqrt(reach**2 - dy**2)
-    else:
-      return target
-    # make & return adjusted target
-    adj_target = Pos(ship.x+dx, ship.y+dy, SHIP_RADIUS)
-    logging.warning('%s adjusts out-of-bounds %s -> %s', ship, target, adj_target)
-    return adj_target
+  # separation net radii
+  def _calc_sep(self, e0, e1, log=False):
+    assert e0 and e1 and e0.radius is not None and e1.radius is not None
+    sep = e0.dist(e1) - e0.radius - e1.radius
+    if log:
+      logging.info('%s --%.2f-- %s', e0, sep, e1)
+    return sep
 
+  # diff(sep, sep_opt)
+  def _diff_opt(self, sep, seps):
+    sep_min, sep_opt, sep_max = seps
+    d = abs(sep - sep_opt)
+    # penalize out-of-bounds
+    if not (sep_min <= sep <= sep_max):
+      d += 100
+    return d
 
-  # TODO instead of pessimistic backoff, try nav around foe WRs
-  def nav_evade(self, ship, goal, evade_paths):
-    # backup when overpowered ?
-    # TMP just go opposite from goal - collision !
-    # TODO still go at goal but avoiding foe WR ?
-    # cross() -> pre_overlap_dist, pre_overlap_pos, overlap_ent
-    weapon_range_crosses = [path.cross(ship) for path in evade_paths]
-    # get nearest hit (pre_overlap_dist, pre_overlap_pos, overlap_ent)
-    d, p, e = min(weapon_range_crosses, key=lambda dpe: ship.dist(dpe[1]))
-    min_hit_pos = p
-    min_hit_dist = ship.dist(p)
-    logging.warning('evade nearest_hit: %s d:%s', min_hit_pos, min_hit_dist)
-    if e:
-      assert e == ship
-      evade_reach = max(0, int(ceil(MAX_SPEED + WEAPON_RADIUS - min_hit_dist)))
-      evade_angle = p.angle(ship) % 360
-      raw_evade_target = ship.get_pos(reach=evade_reach, angle=evade_angle)
-      # check if target out-of-bounds & adjust
-      evade_target = self.adjust_if_out_of_bounds(ship, evade_reach, raw_evade_target)
-      logging.info('%s orig-goal: %s; EVADE-goal %s', ship, goal, evade_target)
-      return self.nav_adapt(ship, evade_target)
-    else:
-      return None, None
-
-
-  # -> nav_comm: Thrust; dest: Entity
-  # return nearest-reachable Pos to goal
-  def nav_adapt(self, ship, goal, evade_paths=[], leader_sep=0.):
-    # if to evade
-    if evade_paths:
-      thrust, dest = self.nav_evade(ship, goal, evade_paths)
-      logging.warning('nav_evade thrust: %s', thrust)
-      if thrust and dest:
-        return thrust, dest
-
-    # get furthest target within reach (int-reach, int-angle away)
-    target = self.get_nav_target(ship, goal)
-    if not target:  # already at goal
-      return None, None
-
-    # adjust based on max_reach
-    # max_reach: ship -> target
-    goal_next_pos = self.next_pos(goal)
-    reach, reach_pos, min_hit_ent = self.max_reach(ship, target, evade_paths)
-    min_sep = reach_pos.dist(goal_next_pos)
-    min_sep_reach = reach
-    min_sep_angle = ship.angle(target)
-    logging.info('sep: %s: beeline', min_sep)
-    # vs max_reach: tang_l & tang_r -> target
-    # keep checking next tangent while separation decreasing
+  # -> nav_comm: Thrust|
+  # -> dest: Entity|
+  # minimize diff(sep, optimal-sep)
+  def nav(self, ship, seps, log=True):
+    logging.info('%s .-.-%s.-.-> %s', ship, seps, ship.target)
+    # set realistic nav_target given separation-constraints
+    nav_target = self.get_nav_target(ship, seps)
+    # get closest beeline -> nav_target
+    sep, reach, reach_pos, min_hit_ent = self.max_reach(ship, nav_target, log)
+    logging.info('sep: %s: beeline', sep)
+    # memo
+    min_res = (
+      self._diff_opt(sep, seps),
+      reach,
+      ship.angle(nav_target)
+    )
+    # if hit, recursive-check tangent-beelines
     if min_hit_ent:
-      _, min_sep, min_sep_reach, min_sep_angle = self.update_sep_from_tangent(set([min_hit_ent]), ship, min_hit_ent, 'L', evade_paths, goal_next_pos, leader_sep, min_sep, min_sep_reach, min_sep_angle)
-      _, min_sep, min_sep_reach, min_sep_angle = self.update_sep_from_tangent(set([min_hit_ent]), ship, min_hit_ent, 'R', evade_paths, goal_next_pos, leader_sep, min_sep, min_sep_reach, min_sep_angle)
+      min_res = self.tang_update_min_res(set(), ship, min_hit_ent, seps, min_res)
 
-    logging.warning((min_sep, min_sep_reach, min_sep_angle))
+    _, reach, angle = min_res
+    # TEST sanity check for no collision
+    tgt = ship.get_pos(reach, angle)
+    _, _, _, hit_ent = self.max_reach(ship, tgt)
+    if hit_ent and hit_ent.owner.id == self.my_id:
+      logging.critical('HIT! %s', hit_ent)
+      while hit_ent and reach > 0:
+        reach -= 1
+        tgt_shorter = ship.get_pos(reach, angle)
+        _, _, _, hit_ent = self.max_reach(ship, tgt_shorter)
+      logging.critical('HIT? %s', hit_ent)
     # return whichever w/ min_hit_ent nearest target
-    thrust = ship.thrust(reach=min_sep_reach, angle=min_sep_angle)
-    dest = ship.get_pos(reach=min_sep_reach, angle=min_sep_angle)
-    logging.info('final sep: %s; %s -> %s', min_sep, ship, dest)
-    return thrust, dest
+    thrust = ship.thrust(reach=reach, angle=angle)
+    ship.dest = ship.get_pos(reach=reach, angle=angle)
+    logging.warning('final: %s -> %s d%.2fr%d^%d ~%.2f ..> %s', ship, ship.dest, *min_res, seps[1], ship.target)
+    return thrust
 
 
-  # integerize thrust reach/angle according to game-engine requirement
+  ### PREDICT
+  # ? update online
+  # TODO consider what opponent considers I will do...
+
+  # game-engine-style-integerize thrust reach & angle
   def _engint(self, reach=None, angle=None):
     if reach is not None:
       return int(reach)
     elif angle is not None:
       return round(angle)
 
-
   # -> path: Vect
-  # naive beeline ship -> goal
-  def get_beeline(self, ship, goal, min_dist=WEAPON_RADIUS-SHIP_RADIUS):
-    target = ship.perigee(goal, min_dist=min_dist)
-    reach = min( self._engint(reach=ship.dist(target)), MAX_SPEED )
-    angle = self._engint(angle=ship.angle(target))
-    eff_target = ship.get_pos(reach, angle)
-    return Vect(ship, eff_target, r=WEAPON_RADIUS)
+  # TODO also predict for foe on mine
+  # TODO incorporate lite version of own nav logic ?
+  def next_path(self, ship, log=False):
+    if ship.next_path:
+      return ship.next_path
+    # if no target assume stay
+    if not ship.goal:
+      return Vect(ship, ship.curr_pos)
 
-  # PREDICT
-  # TODO consider what opponent considers I will do...
+    seps = (0., 0., 0.)
+    if isinstance(ship.goal, Planet):
+      seps = SEPS_DOCK
+    if isinstance(ship.goal, Ship):
+      seps = SEPS_FIGHT
+    # assume foe beelines for goal
+    ship.target = ship.goal
+    nav_target = self.get_nav_target(ship, seps, log)
+    # reach = min( self._engint(reach=ship.dist(target)), MAX_SPEED )
+    # # logging.info('reach: %s', reach)
+    # angle = self._engint(angle=ship.angle(target))
+    # eff_target = ship.get_pos(reach, angle)
+    # eff_target.owner = ship
+    # return Vect(ship, eff_target, r=WEAPON_RADIUS)
+    return Vect(ship, nav_target)
+
   # contextualize Ship.next_pos
   # eg adjust planet-interior to nearest point on planet-surface
   # based on player_eval_goals
   # -> Pos
-  def next_pos(self, ent):
-    if isinstance(ent, Ship):
+  def next_pos(self, ent, log=False):
+    next_pos = None
+    if isinstance(ent, (Planet, Pos)):
+      next_pos = ent
+    elif ent.next_pos:
+      next_pos = ent.next_pos
+    else:
+      assert isinstance(ent, Ship)
       if not ent.is_mobo():
         ent.next_pos = ent.curr_pos
-      else:
-        player_id = ent.owner_id
-        goal = ent.goal or ent  # if no goal assume stay
-        # TMP
-        ship_path = self.get_beeline(ent, goal)
+      else:  # mobo
+        # TODO improve core guess logic
+        ship_path = self.next_path(ent, log=log)
         ent.next_pos = ship_path.e1
         for planet in self._planets.values():
-          if ent.next_pos in planet:
-            ent.next_pos = ent.perigee(planet, min_dist=SHIP_RADIUS)
+          if planet.overlap(ent.next_pos):
+            ent.next_pos = ent.perigee(planet, sep=SHIP_RADIUS)
             break
-      return ent.next_pos
-    else:  # Planet | Pos
-      return ent
+      next_pos = ent.next_pos
 
-  # -> Vect
-  def next_path(self, ship, radius=WEAPON_RADIUS):
-    next_pos = self.next_pos(ship)
-    return Vect(ship, next_pos)
+    assert isinstance(next_pos, (Planet, Pos))
+    return next_pos
 
 
 

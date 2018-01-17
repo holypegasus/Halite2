@@ -20,7 +20,7 @@ def timit(f):
     t0 = time()
     result = f(*args, **kwargs)
     t1 = time()
-    logging.critical('%s took: %.0f ms', f.__name__, (t1-t0)*1000)
+    logging.critical('%s: %.0f ms', f.__name__, (t1-t0)*1000)
     return result
   return wrap
 

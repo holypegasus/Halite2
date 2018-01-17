@@ -3,10 +3,10 @@
 
 # from hlt.util import *
 # from hlt.plot import Pltr
-# from hlt.entity import *
+from hlt.entity import *
 
 
-test = 'type'
+test = 'vect_cross'
 
 
 if test=='geo':
@@ -50,17 +50,9 @@ if test=='geo':
 
   pltr.savefig('test')
 if test=='vect_cross':
-  p0 = Pos(-3, 0, .5)
-  p1 = Pos(4, 0, .5)
-  v_hori = Vect(p0, p1)
-  p2 = Pos(0, -3, .5)
-  p3 = Pos(0, 4, .5)
-  v_verti = Vect(p2, p3)
-  p4 = Pos(7, -3, .5)
-  v_hori_2 = Vect(p2, p4)
-  assert v_hori.cross(v_verti)
-  assert v_hori.cross(v_hori)
-  assert not v_hori.cross(v_hori_2)
+  v0 = Vect(Pos(38.00, 29.00), Pos(42.37, 31.42))
+  v1 = Vect(Pos(38.00, 32.00), Pos(42.98, 31.56))
+  print(v0.cross(v1))
 elif test=='simple_gen':
   def num_gen(n=2):
     for i in range(n):

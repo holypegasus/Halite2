@@ -54,6 +54,7 @@ def stat():
         tokens = [t.strip('#,') for t in stat_line.split(_SPACE_DELIMITER)]
         bot_name = tokens[_IDX_NAME]
         if int(tokens[_IDX_RANK]) == 1:
+          print('Winner: %s'%(bot_name))
           winner_counts[bot_name] += 1
           final_turn = tokens[_IDX_TURNS_ALIVE]
         overall_stats[bot_name] += Counter({

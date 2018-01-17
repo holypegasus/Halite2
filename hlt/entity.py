@@ -5,7 +5,7 @@ from operator import truediv
 
 from .constants import DOCK_TURNS, BASE_PRODUCTIVITY, PROD_FOR_SHIP, SPAWN_RADIUS
 from .constants import SHIP_RADIUS, DOCK_RADIUS, WEAPON_RADIUS, MIN_MOVE_SPEED, MAX_SPEED
-from .constants import TOLERANCE, PRECISION
+from .constants import FUDGE, TOL, PRECISION
 from .util import logitr
 
 
@@ -44,35 +44,48 @@ class Entity:
     dist = self.dist(target, precision)
     if isinstance(target, Planet):
       dist = dist - target.radius - DOCK_RADIUS
-    elif isinstance(target, Ship):
+    else:  # Ship or Pos
       dist = dist - WEAPON_RADIUS
-    # dist = max(0, dist)
+    dist = max(0, dist)
     return dist
 
-  def same_pos(self, other, tol=TOLERANCE):
+  def same_pos(self, other, tol=TOL):
     assert isinstance(other, Entity)
     return abs(self.x - other.x) < tol and abs(self.y - other.y) < tol
 
   # if 2 Entities' radii overlap
-  def overlap(self, other, fudge=0.01):
-    dist = self.dist(other)
-    no_hit_radius = self.radius + other.radius
-    if dist - fudge < no_hit_radius:
-      logging.debug('%s<->%s: d: %s ?<= %s', self, other, dist, no_hit_radius)
-      return True
-    else:
-      return False
+  # TEST add 4 boundaries as hard-checks ?
+  def overlap(self, other, fudge=FUDGE):
+    res = False
+    if other:
+      if other.radius:
+        dist = self.dist(other)
+        hit_radius = self.radius + other.radius
+        if dist - fudge < hit_radius:
+          res = True
+      # elif isinstance(other, Bound):  # check bound
+      #   if self.x - self.radius 
+
+    logging.debug('%s <-> %s: d: %s ?<= %s: %s', self, other, dist, hit_radius, res)
+    # print('%s <-> %s: d: %s ?<= %s: %s'%(self, other, dist, hit_radius, res))
+    return res
 
   def angle(self, target):
     return math.degrees(math.atan2(target.y - self.y, target.x - self.x)) % 360
   
   # -> perigee: Pos
-  # self ---- perigee : min_dist : target.radius : target
-  def perigee(self, target, min_dist):
+  # nearest Pos sep away from target (net radii)
+  # self --> perigee|...sep...|target
+  def perigee(self, target, sep, log=False):
     angle = target.angle(self)
-    x = target.x + (target.radius+min_dist) * math.cos(math.radians(angle))
-    y = target.y + (target.radius+min_dist) * math.sin(math.radians(angle))
-    return Pos(x, y)
+    # set pos (d: sep; a: angle) away from target
+    d = int(self.radius + sep + target.radius)
+    x = target.x + d * math.cos(math.radians(angle))
+    y = target.y + d * math.sin(math.radians(angle))
+    pos = Pos(x, y)
+    if log and self.dist(target) < d:
+      logging.warning('backoff! ^%d %s', angle, pos)
+    return pos
 
   # -> Pos
   def get_pos(self, reach, angle, r=SHIP_RADIUS):
@@ -122,15 +135,15 @@ class Planet(Entity):
     self.current_production = current
     self.remaining_resources = remaining  # depr
     self.health = hp
-    self.owner_id = owner_id if bool(int(owned)) else None
+    self.owner_id = owner_id if owned else None
+    self.name = '%sPl%s'%(self.owner_id, self.id)
     self.owner = None  # filled by _link()
     self._docked_ship_ids = docked_ships
     self._docked_ships = {}
-    ###
+    ### custom
     self.goals_of = set()
     self.pid2goals_of = dict()  # pid -> goals_of: set
     self.n_open_docks = self.num_docking_spots - len(self.goals_of)
-    ### TOUSE
     self.spawn_pos = None  # filled by set_spawn_pos during game_map._parse()
     self.perimeter_threats = deque()  # (dist, next_pos, foe)
 
@@ -155,13 +168,8 @@ class Planet(Entity):
       goal_of.goal = None
     self.goal_of = set()
 
-  # -> bool
-  # if pos is inside planet
-  def __contains__(self, pos):
-    return self.dist(pos) < self.radius
-
   def set_spawn_pos(self, center):
-    self.spawn_pos = center.perigee(self, min_dist=SPAWN_RADIUS)
+    self.spawn_pos = center.perigee(self, sep=SPAWN_RADIUS)
 
   def turns_to_next_ship(self, add_producer=0):
     prod_to_next_ship = (PROD_FOR_SHIP - self.current_production) / BASE_PRODUCTIVITY
@@ -276,7 +284,7 @@ class Planet(Entity):
     )
 
   def __str__(self):
-    return "{}_{}_{} @({:.2f}, {:.2f}, {:.2f})".format(
+    return "%s%s%s @(%.2f, %.2f, %.2f)"%(
       self.owner_id , self.__class__.__name__[:2], self.id, self.x, self.y, self.radius)
 
 
@@ -301,6 +309,7 @@ class Ship(Entity):
     UNDOCKING = 3
 
   def __init__(self, owner_id, ship_id, x, y, hp, vel_x, vel_y, docking_status, planet_id, progress, cooldown):
+    self.name = '%sS%s'%(owner_id, ship_id)
     self.id = ship_id
     self.x = x
     self.y = y
@@ -313,20 +322,24 @@ class Ship(Entity):
     self.planet = None  # filled by _link()
     self._docking_progress = progress
     self._weapon_cooldown = cooldown
-    # memory
-    self.goal = None
-    self.dest = None
+    ### memory
+    ## intent
+    self.goal = None  # Planet | Ship
+    self.target = None  # Pos  (may be out-of-reach)
+    self.dest = None  # Pos (will reach)
+    self.swarm = set()  # all other ships in swarm
+    self.evading = False
+    self.evade_paths = []
     # self.goal_status = None
     self.goals_of = set()
     self.pid2goals_of = dict()  # pid -> goals_of: set
-    self.curr_pos = Pos(x, y, SHIP_RADIUS, pos_id=self.id)
-    self.prev_vect = Vect()
-    self.prev_vects = []
-    self.swarm = set()
-    # predictives
+    ## spatial
     # NB reset to None beginning of each turn; set by first call to game_map.next_pos() (including foe's eval_goal !)
+    self.curr_pos = Pos(x, y, SHIP_RADIUS, pos_id=self.id)
+    self.prev_path = Vect()
+    self.prev_paths = []
     self.next_pos = None
-    self.next_path = Vect()
+    self.next_path = None  # Vect
 
   #######
   # NB update existing ship w/ new info instead of creating new
@@ -335,16 +348,7 @@ class Ship(Entity):
       type(self)==type(new_ship) and
       self.owner_id==new_ship.owner_id and
       self.id==new_ship.id)
-    # deduce previous Vect move
-    prev_pos = self.curr_pos
-    curr_pos = Pos(new_ship.x, new_ship.y, new_ship.radius, pos_id=self.id)
-    self.prev_vect = Vect(prev_pos, curr_pos, vector_id=self.id, owner_id=self.owner_id)
-    self.prev_vects.append(self.prev_vect)
-    self.curr_pos = curr_pos
-    self.dest = None
-    self.next_pos = None
-    # swarm stuff
-    # other updates
+    # basic
     self.x = new_ship.x
     self.y = new_ship.y
     self.health = new_ship.health
@@ -352,6 +356,22 @@ class Ship(Entity):
     self.planet = new_ship.planet
     self._docking_progress = new_ship._docking_progress
     self._weapon_cooldown = new_ship._weapon_cooldown
+    ## intent
+    # self.goal = None  # Planet | Ship
+    self.target = None  # Pos  (may be out-of-reach)
+    self.dest = None  # Pos (will reach)
+    self.swarm = set()  # all other ships in swarm
+    self.evading = False
+    self.evade_paths = []
+    ## spatial
+    # deduce previous Vect move
+    prev_pos = self.curr_pos
+    curr_pos = Pos(new_ship.x, new_ship.y, new_ship.radius, pos_id=self.id)
+    self.prev_path = Vect(prev_pos, curr_pos, vector_id=self.id, owner=self)
+    self.prev_paths.append(self.prev_path)
+    self.curr_pos = curr_pos
+    self.next_pos = None
+    self.next_path = None
 
   # update dependencies to reflect its deletion
   def del_ship(self):
@@ -362,43 +382,28 @@ class Ship(Entity):
       if buddy != self:
         buddy.swarm.remove(self)
 
-  def join_swarm(self, ship):
-    # check if already in swarm
-    if self in ship.swarm:
+  def join_swarm(self, ldr):
+    assert isinstance(ldr, Ship)
+    # check if already in leader's swarm
+    if self in ldr.swarm:
       pass
     # leave prev swarm
-    # logging.warning('%s -> %s', self.swarm, self)
     for s in self.swarm:
       s.swarm.remove(self)
     # join new swarm
-    # logging.warning('%s -> %s', self, ship.swarm)
-    for s in ship.swarm:
+    for s in ldr.swarm:
       s.swarm.add(self)
-    self.swarm = ship.swarm | set([ship])
-    ship.swarm.add(self)
+    self.swarm = ldr.swarm | set([ldr])
+    ldr.swarm.add(self)
+    # note ship's own swarm does not include self !!!
+    logging.warning('%s -> %s: %s',self.name, ldr.name,
+      [s.id for s in ldr.swarm|set([ldr])])
 
   def is_mobo(self):
     return self.docking_status == self.DockingStatus.UNDOCKED
 
-  # TMP if foe_ship is matched in strength
-  def is_matched(self, assigned_ships=set()):
-    if self.is_mobo():
-      planned_ships = self.goals_of
-      return sum(s.health for s in planned_ships) >= self.health
-    else:
-      return True if self.goals_of else False
 
-  def curr_pos(self):
-    if not self.curr_pos:
-      self.curr_pos = Pos(self.x, self.y, self.radius, self.id, self.owner_id)
-    return self.curr_pos
-
-  # ?
-  def next_pos(self):
-    return self.next_pos
   #######
-
-
   def thrust(self, reach, angle):
     """
     Generate a command to accelerate this ship.
@@ -424,12 +429,11 @@ class Ship(Entity):
     :rtype: bool
     """
     assert isinstance(planet, Planet)
-    return self.dist(planet) <= planet.radius + DOCK_RADIUS
+    return self.dist(planet) <= planet.radius + DOCK_RADIUS - TOL
 
-  def can_dock_tight(self, planet):
+  def __can_dock_tight(self, planet):
     assert isinstance(planet, Planet)
     return self.dist(planet) <= planet.radius + SHIP_RADIUS*3
-
 
   def dock(self, planet):
     """
@@ -449,6 +453,10 @@ class Ship(Entity):
     :rtype: str
     """
     return "u {}".format(self.id)
+
+  def can_fire_on(self, other, add_range=0.):
+    assert isinstance(other, Pos)
+    return self.dist(other) <= add_range + WEAPON_RADIUS - TOL
 
   def _link(self, players, planets):
     """
@@ -509,7 +517,7 @@ class Ship(Entity):
     return self.id < other.id
 
   def __str__(self):
-    return '%s_%s_%s @(%.2f, %.2f)'%(
+    return '%s%s%s @(%.2f, %.2f)'%(
       self.owner_id, self.__class__.__name__[:1], self.id, self.x, self.y)
 
 
@@ -525,14 +533,13 @@ class Pos(Entity):
   :ivar health: Unused.
   :ivar owner: Unused.
   """
-
-  def __init__(self, x, y, r=0., pos_id=None, owner_id=None, health=None):
+  def __init__(self, x, y, r=0., pos_id=None, owner=None, health=None):
     self.x = x
     self.y = y
     self.radius = r
     self.health = health
     self.id = pos_id
-    self.owner_id = owner_id
+    self.owner = owner  # Ship
 
   #######
   # -> Vect
@@ -550,8 +557,33 @@ class Pos(Entity):
     raise NotImplementedError("Pos should not have link attributes.")
 
   def __str__(self):
-    return '@~(%.2f, %.2f)'%(self.x, self.y)
+    short_owner_str = ''
+    if self.owner:
+      short_owner_str = str(self.owner).split('@')[0]
+    return '%s@~(%.2f, %.2f)'%(short_owner_str, self.x, self.y)
 
+
+# 1 Bound to repr map-edges
+class Bound(Entity):
+  def __init__(self, x_min, x_max, y_min, y_max):
+    self.x_min = x_min
+    self.x_max = x_max
+    self.y_min = y_min
+    self.y_max = y_max
+    self.owner = 'game_map_boundary!'
+
+  def bounds(self, pos):
+    assert isinstance(pos, Pos), pos
+    # pos_x_min = pos.x - pos.radius
+    # pos_x_max = pos.x + pos.radius
+    # pos_y_min = pos.y - pos.radius
+    # pos_y_max = pos.y + pos.radius
+    return any([
+      pos.x < self.x_min,
+      self.x_max < pos.x,
+      pos.y < self.y_min,
+      self.y_max < pos.y, 
+    ])
 
 # ? move util.Line here
 # move their tests into test.py
@@ -563,7 +595,7 @@ class Vect(Entity):
     b = self.y0 - m * self.x0
     return m, b
 
-  def __init__(self, e0=None, e1=None, r=0., tol=TOLERANCE, pc=PRECISION, vector_id=None, owner_id=None):
+  def __init__(self, e0=None, e1=None, r=SHIP_RADIUS, tol=TOL, pc=PRECISION, vector_id=None, owner=None):
     self.e0 = e0
     self.e1 = e1
     if e0 and e1:
@@ -586,7 +618,15 @@ class Vect(Entity):
     self.tol = tol
     self.precision = pc
     self.id = vector_id
-    self.owner_id = owner_id
+    self.owner = owner or e0 # Ship
+
+  def __add__(self, vect):
+    assert isinstance(vect, Vect)
+    return Vect(e0, e1+vect, r=self.radius)
+
+  # TODO dist between two Vect centers
+  def dist(self, another):
+    pass
 
   def is_pos(self):
     return self.e0.same_pos(self.e1) or self.len < MIN_MOVE_SPEED
@@ -595,29 +635,32 @@ class Vect(Entity):
   def t_along(self, time):
     x = self.e0.x + self.dx * time
     y = self.e0.y + self.dy * time
-    return Pos(x, y, self.radius)
+    return Pos(x, y, self.radius, owner=self.owner)
 
   # Pos @ dist along Vect
-  def d_along(self, dist, tol=TOLERANCE):
+  def d_along(self, dist, tol=TOL):
     fract_turn = float(dist) / self.len
     assert fract_turn <= 1.+tol, 'fract_turn = %s'%fract_turn
     return self.t_along(fract_turn)
 
-  # -> pre_overlap_dist: float; pre_overlap_pos: Pos; overlap_ent: Entity
+  # -> pre_overlap_dist: float
+  # -> pre_overlap_pos: Pos
+  # -> overlap_ent: Entity
   # first overlap (dist, obst_pos)
   # time-sensitive intersection check by checking discrete segment-pts along
   # works for Vect vs Vect or Vect vs Pos
   # TODO improve by making check geometric instead of discrete?
-  def cross(self, other, precision=PRECISION):
+  def cross(self, other, tol=TOL, precision=PRECISION):
     # max-speed of 7 -> max 14 radius-0.5 'bubbles'
     # TODO mathematize check VS finer intervals ?
     n_segments = int(MAX_SPEED / SHIP_RADIUS) * 2
     dt = 1 / n_segments
     pre_overlap_dist = self.len
-    pre_overlap_pos = self.e1
+    # pre_overlap_pos = self.e1
     overlap_ent = None
     # TODO consider if self = 0-len Vect aka Pos
-    prev_dist = float('inf')
+    # TODO merge ?
+    prev_dist = math.inf
     if isinstance(other, Vect):  # comp self.seg_Pos w/ other.seg_Pos t_along
       for k in range(1, n_segments+1):
         t = k * dt
@@ -625,7 +668,7 @@ class Vect(Entity):
         pos_other = other.t_along(t)
         if pos_self.overlap(pos_other):
           pre_overlap_dist = self.len * (t - dt)
-          pre_overlap_pos = self.t_along(t - dt)
+          # pre_overlap_pos = self.t_along(t - dt)
           overlap_ent = pos_other
           break
         else:
@@ -634,6 +677,17 @@ class Vect(Entity):
             break
           else:
             prev_dist = curr_dist
+    elif isinstance(other, Bound):
+      for k in range(1, n_segments+1):
+        t = k * dt
+        pos_self = self.t_along(t)
+        if other.bounds(pos_self):
+          pre_overlap_dist = self.len * (t - dt)
+          # pre_overlap_pos = self.t_along(t - dt)
+          overlap_ent = self.t_along(t - dt)
+          logging.info('%s Hit Bound! r%.1f, %s', self, pre_overlap_dist, overlap_ent)
+          break
+
     else:  # some sort of Pos - comp self.seg_Pos t_along w/ other.seg_Pos
       for k in range(1, n_segments+1):
         t = k * dt
@@ -641,7 +695,7 @@ class Vect(Entity):
         pos_other = other
         if pos_self.overlap(pos_other):
           pre_overlap_dist = self.len * (t - dt)
-          pre_overlap_pos = self.t_along(t - dt)
+          # pre_overlap_pos = self.t_along(t - dt)
           overlap_ent = pos_other
           break
         else:
@@ -651,7 +705,13 @@ class Vect(Entity):
           else:
             prev_dist = curr_dist
 
-    return pre_overlap_dist, pre_overlap_pos, overlap_ent
+    # label obj w/ owner
+    # pre_overlap_pos.owner = self.owner
+    # TMP log Vect cross owners
+    if overlap_ent:
+      logging.warning("%s x %s: %s", self, other, overlap_ent)
+      overlap_ent.owner = other.owner
+    return pre_overlap_dist, overlap_ent
 
   def _gen_pts(self, n):  # generate n pts along line, including end-points e0, e1
     assert n > 1
@@ -671,3 +731,5 @@ class Vect(Entity):
 
   def __repr__(self):
     return self.__str__()
+
+

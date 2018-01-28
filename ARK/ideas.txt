@@ -49,11 +49,11 @@ Bot History
         allow more compact routing?
       max-reach
         nearest-obstacle -> max-reach -> max-thrust
-  ~~~~~~~~~~~~~~
-  v10_guess_scan_evade_swarm  WIP
+  v10_guess_scan_evade_swarm  
     nav
       smart_adjust
         alter angle by tangent of nearest-obstacle
+        recurse on unexplored hits
       check_boundary
         adjust target if out-of-bounds
     strat
@@ -69,15 +69,19 @@ Bot History
       swarm-rotate
         lower hp further back
         visual: Roman legionaries ~ 风灵珠
-        sep_opt -= swarm-hp-normalized-% * UNIT
+        sep_opt -= swarm-hp-normalized-% * SEP_BUFFER
+  ~~~~~~~~~~~~~~
 
-  v11
+  v11  WIP
     ignore foe_imobo stren if not w/ foe_mobo
     engage planet-scan foe only if undermatched
       drop previous goal-stickiness
-
     if even match, evade no further than my_imobo nearest foe
     consider planet pending ships
+
+  v12  WIP
+    - if even match, evade no further than my_imobo nearest foe
+    - consider planet pending ships
 
 
   TODO
@@ -115,24 +119,7 @@ Policy
 
 
 
-Selecting target
-  pass 0
-    each ship keeps auto-resorted {effective-dist: target}
-    globally also keep auto-resorted {effective-dist: my_ship}
-  pass 1
-    pop-off 1st
-    update all others
-    repeat
-
-
-Spatial scan
-  {x: y: Entity}
-  within tol, trace along sight-path & check (x->y) for collision
-
-
-
-
-Tools
+TOOLING
   run_game.sh & gym.sh
     $1 vs MyBot
     mv outputs
@@ -152,4 +139,3 @@ Tools
       sizes
       which bots
       num games
-  ~~~~~~~~~~~~~~
